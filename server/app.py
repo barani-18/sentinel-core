@@ -18,8 +18,8 @@ from sqlalchemy.orm import Session
 
 # Add the current directory to sys.path so imports work regardless of 
 # how the validator calls the file.
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 # ... (Keep your imports) ...
 from database import engine, SessionLocal, get_db
 import models
@@ -529,5 +529,5 @@ def main():
     # Set port to 7860 (Standard for Hugging Face)
     uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
