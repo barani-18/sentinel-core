@@ -500,18 +500,9 @@ def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
 # ---------- Runner ----------
-def main():
+if __name__ == "__main__":
     import uvicorn
     import os
-    
-    # Get the port from the environment, defaulting to 7860
-    port = int(os.environ.get("PORT", 7860))
-    
-    # IMPORTANT: We only run this if we're NOT already inside a uvicorn process
-    # This prevents the "Address already in use" error during validation
-    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
 
-if __name__ == "__main__":
-    # This guard is now extra important! 
-    # It ensures that 'main()' only runs if you call 'python server/app.py' directly.
-    main()
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
