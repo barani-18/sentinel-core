@@ -492,6 +492,9 @@ def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
 # ---------- Run ----------
+from server.app import main
+
 if __name__ == "__main__":
+    main()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
