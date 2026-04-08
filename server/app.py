@@ -492,6 +492,14 @@ def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
 # ---------- Run ----------
-if __name__ == "__main__":
+# ... (keep all your existing code above) ...
+
+# 1. Add the main function the validator is looking for
+def main():
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    # Make sure the port matches what your Docker/Hugging Face expects (usually 7860 or 8000)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False)
+
+# 2. Add the standard caller
+if __name__ == "__main__":
+    main()
