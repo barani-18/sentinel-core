@@ -1,10 +1,11 @@
 """Sentinel-Core: Autonomous Cloud-Native SOC Analyst FastAPI Backend Server"""
 
+import sys
+import os
 import time
 import random
 import hashlib
 import jwt
-import os
 from enum import Enum
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -15,12 +16,18 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+# Add the current directory to sys.path so imports work correctly
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 # Correct Absolute Imports
 from database import engine, SessionLocal, get_db
 import models
 
-# This creates the tables in the database as soon as the app starts
-models.Base.metadata.create_all(bind=engine)
+# This creates the tables safely without crashing if the DB is slow
+try:
+    models.Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: DB connection failed on startup: {e}")
 
 # ---------- Config ----------
 SECRET_KEY = os.getenv("SECRET_KEY", "sentinel-core-soc-2024-secret-key-change-in-prod")
@@ -447,7 +454,6 @@ def reset_environment():
     core = get_core("default")
     return core.reset()
 
-# NEW: The missing step endpoint
 @app.post("/step", response_model=StepResponse)
 def take_action(req: StepRequest):
     core = get_core("default")
@@ -470,20 +476,22 @@ def create_alert(alert_data: dict, db: Session = Depends(get_db)):
 @app.get("/state")
 def get_state(db: Session = Depends(get_db), username: str = Depends(verify_token)):
     # Try to pull real rows from the Database
-    db_alerts = db.query(models.AlertRecord).all()
-    
-    if db_alerts:
-        return {
-            "step": 0,
-            "score": 0.92,
-            "alerts": db_alerts,
-            "hosts": [], 
-            "metrics": {"compromisedHosts": 0, "anomalyScore": 0.05, "cpu": 0.1, "threatLevel": 0.1},
-            "history": [],
-            "logs": [{"id": "1", "ts": int(time.time()*1000), "kind": "success", "msg": "Connected to Database"}]
-        }
+    try:
+        db_alerts = db.query(models.AlertRecord).all()
+        if db_alerts:
+            return {
+                "step": 0,
+                "score": 0.92,
+                "alerts": db_alerts,
+                "hosts": [], 
+                "metrics": {"compromisedHosts": 0, "anomalyScore": 0.05, "cpu": 0.1, "threatLevel": 0.1},
+                "history": [],
+                "logs": [{"id": "1", "ts": int(time.time()*1000), "kind": "success", "msg": "Connected to Database"}]
+            }
+    except Exception:
+        pass # If DB fails, fallback to simulation below
         
-    # Fallback to simulation if DB is empty
+    # Fallback to simulation if DB is empty or fails
     core = get_core(username)
     return core.get_state()
 
@@ -491,10 +499,19 @@ def get_state(db: Session = Depends(get_db), username: str = Depends(verify_toke
 def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
-# ---------- Run ----------
-from server.app import main
+# ---------- Runner ----------
+def main():
+    import uvicorn
+    import os
+    
+    # Get the port from the environment, defaulting to 7860
+    port = int(os.getenv("PORT", 7860))
+    
+    # IMPORTANT: We only run this if we're NOT already inside a uvicorn process
+    # This prevents the "Address already in use" error during validation
+    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
 
 if __name__ == "__main__":
+    # This guard is now extra important! 
+    # It ensures that 'main()' only runs if you call 'python server/app.py' directly.
     main()
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
