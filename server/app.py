@@ -18,8 +18,8 @@ from sqlalchemy.orm import Session
 
 # Add the current directory to sys.path so imports work regardless of 
 # how the validator calls the file.
-sys.path.append(os.path.dirname(os.path.abspath(_file_)))
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # ... (Keep your imports) ...
 from database import engine, SessionLocal, get_db
 import models
