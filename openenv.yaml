@@ -1,0 +1,12 @@
+version: "1.0"
+name: "sentinel-core"
+entrypoint: "inference:app"
+api_type: "fastapi"
+
+# These define the basic structure for the evaluator
+env_config:
+  observation_space:
+    type: "dict"
+  action_space:
+    type: "discrete"
+    description: "SOC Analyst actions: investigate, block_ip, isolate_host, ignore, escalate, resolve"
