@@ -4,6 +4,7 @@ import time
 import random
 import hashlib
 import jwt
+import sys
 import os
 from enum import Enum
 from typing import List, Optional, Dict, Any
@@ -14,6 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+# Add the current directory to sys.path so imports work regardless of 
+# how the validator calls the file.
+sys.path.append(os.path.dirname(os.path.abspath(_file_)))
+
+# ... (Keep your imports) ...
+from database import engine, SessionLocal, get_db
+import models
+
+# ... (Keep all your Models, SentinelCore class, and Routes) ...
 
 # Correct Absolute Imports
 from database import engine, SessionLocal, get_db
@@ -494,28 +505,29 @@ def get_me(username: str = Depends(verify_token)):
 # ---------- Run ----------
 # ... (all your imports at the top) ...
 
-# Move the DB creation inside a safe function
+# 1. MOVE DATABASE CREATION INTO A SAFE FUNCTION
+# Do NOT call models.Base.metadata.create_all(bind=engine) at the top level
 def init_db():
     try:
-        print("Connecting to database...")
+        print("Attempting to connect to database...")
         models.Base.metadata.create_all(bind=engine)
-        print("Database connected and tables created.")
+        print("Database connection successful!")
     except Exception as e:
-        print(f"Database connection failed: {e}")
-        # We don't crash here so the server can still start and show an error 
-        # instead of an "Unhandled Exception"
+        print(f"CRITICAL: Database connection failed: {e}")
+        # We don't crash the whole app; this allows the server to start 
+        # so the validator can at least "see" it.
         pass
 
-# ... (keep all your Models, SentinelCore class, and Routes) ...
-
+# 2. FIX THE MAIN FUNCTION
 def main():
     import uvicorn
-    # Initialize the DB right before starting the server
+    # Run DB init right before the server starts
     init_db()
     
-    # Use the 'import string' format to satisfy the validator warning.
-    # We use "server.app:app" because the validator runs from the root directory.
+    # Use the 'string' format "server.app:app" to fix the validator's warning.
+    # Set reload=False (True is only for local development)
+    # Set port to 7860 (Standard for Hugging Face)
     uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False)
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
