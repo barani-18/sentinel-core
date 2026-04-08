@@ -500,9 +500,13 @@ def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
 # ---------- Runner ----------
-if __name__ == "__main__":
+def main():
     import uvicorn
     import os
 
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
+
+
+if __name__ == "__main__":
+    main()
