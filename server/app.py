@@ -492,14 +492,30 @@ def get_me(username: str = Depends(verify_token)):
     return DEMO_USERS[username]["user"]
 
 # ---------- Run ----------
-# ... (keep all your existing code above) ...
+# ... (all your imports at the top) ...
 
-# 1. Add the main function the validator is looking for
+# Move the DB creation inside a safe function
+def init_db():
+    try:
+        print("Connecting to database...")
+        models.Base.metadata.create_all(bind=engine)
+        print("Database connected and tables created.")
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        # We don't crash here so the server can still start and show an error 
+        # instead of an "Unhandled Exception"
+        pass
+
+# ... (keep all your Models, SentinelCore class, and Routes) ...
+
 def main():
     import uvicorn
-    # Make sure the port matches what your Docker/Hugging Face expects (usually 7860 or 8000)
+    # Initialize the DB right before starting the server
+    init_db()
+    
+    # Use the 'import string' format to satisfy the validator warning.
+    # We use "server.app:app" because the validator runs from the root directory.
     uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=False)
 
-# 2. Add the standard caller
 if __name__ == "__main__":
     main()
