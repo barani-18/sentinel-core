@@ -1,125 +1,96 @@
-"""
-SentinelCore Inference Script
-===================================
-Connects to the local FastAPI SOC simulator and evaluates using the OpenAI client.
-Strictly adheres to the hackathon's LLM Proxy and HF_TOKEN rules.
-"""
-
 import os
+import time
 import requests
 import textwrap
-from typing import List, Optional
 from openai import OpenAI
 
 # ---------------------------------------------------------
-# STRICT RULE COMPLIANCE: Configuration
-# 1. Read with os.getenv()
-# 2. API_BASE_URL and MODEL_NAME have defaults.
-# 3. HF_TOKEN is required and raises an error if missing.
+# MANDATORY: STRICT PROXY INITIALIZATION
+# Verbatim from the validator "How to fix" instructions.
 # ---------------------------------------------------------
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
+API_BASE_URL = os.environ["API_BASE_URL"]
+API_KEY = os.environ["API_KEY"] 
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-if not HF_TOKEN:
-    raise ValueError("FATAL: HF_TOKEN environment variable is missing. This is required by the hackathon rules.")
-
-TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
-BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
+# Local FastAPI Endpoint
 FASTAPI_URL = "http://localhost:8000"
 
-# --- Mandatory Logging Functions ---
-def log_start(task: str, env: str, model: str) -> None:
+def log_start(task, env, model):
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+def log_step(step, action, reward, done, error):
     error_val = error if error else "null"
-    done_val = str(done).lower()
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_val}", flush=True)
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success, steps, score, rewards):
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-def main() -> None:
-    # ---------------------------------------------------------
-    # STRICT RULE COMPLIANCE: OpenAI Client Initialization
-    # Must use the exact variable names they specified.
-    # ---------------------------------------------------------
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=HF_TOKEN
-    )
+def main():
+    # 1. Initialize client EXACTLY as requested by the Validator Log
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    
+    log_start("soc_investigation", "sentinel_soc", MODEL_NAME)
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    # 2. WAIT FOR SERVER: Prevents "Connection Refused" while FastAPI boots
+    current_state = {}
+    connected = False
+    for i in range(15):
+        try:
+            # Try to ping your FastAPI reset endpoint
+            resp = requests.post(f"{FASTAPI_URL}/reset", json={}, timeout=5)
+            if resp.status_code == 200:
+                current_state = resp.json().get("state", {})
+                connected = True
+                break
+        except Exception:
+            print(f"[DEBUG] Waiting for FastAPI server... (Attempt {i+1}/15)", flush=True)
+            time.sleep(3)
 
-    # 1. Reset FastAPI Environment (with loud crash if it fails)
-    try:
-        reset_resp = requests.post(f"{FASTAPI_URL}/reset", json={}, timeout=15.0)
-        reset_resp.raise_for_status()
-        current_state = reset_resp.json().get("state", {})
-    except Exception as e:
-        log_step(1, "reset", 0.0, True, f"Failed to connect to FastAPI: {e}")
+    if not connected:
+        print("[DEBUG] FATAL: FastAPI server on port 8000 never responded.")
         log_end(False, 0, 0.0, [])
         return
 
-    history: List[str] = []
-    rewards: List[float] = []
-    steps_taken = 0
+    rewards = []
+    # 3. CORE LOOP: Hits the LLM proxy to pass the criteria check
+    for step in range(1, 9):
+        try:
+            # Mandatory LLM call through LiteLLM Proxy
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a SOC AI. Answer with one word: investigate, isolate, block, ignore."},
+                    {"role": "user", "content": f"System Metrics: {current_state.get('metrics')}. What is your action?"}
+                ],
+                max_tokens=10
+            )
+            action = completion.choices[0].message.content.strip().lower()
+            
+            # Simple cleanup for valid actions
+            action = next((v for v in ["investigate", "isolate", "block", "ignore"] if v in action), "investigate")
 
-    # 2. Simulation Loop
-    for step in range(1, 9): # MAX 8 STEPS
-        prompt = textwrap.dedent(f"""
-            You are an autonomous SOC Analyst. 
-            Step: {step}
-            Current CPU: {current_state.get('metrics', {}).get('cpu', 'Unknown')}
-            Threat Level: {current_state.get('metrics', {}).get('threatLevel', 'Unknown')}
-            Respond with exactly one action word: investigate, isolate, block, ignore.
-        """).strip()
-
-        # Call the LLM Proxy (Loud crash if the proxy fails)
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a cybersecurity AI. Respond with a single action word."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=10,
-            timeout=30.0 
-        )
-        
-        text = (completion.choices[0].message.content or "").strip().lower()
-        
-        # Parse Action
-        action_kind = "investigate" # Fallback
-        for valid in ["investigate", "isolate", "block", "ignore"]:
-            if valid in text:
-                action_kind = valid
+            # Execute action via your local FastAPI server
+            resp = requests.post(f"{FASTAPI_URL}/api/step", json={"kind": action, "alertId": None})
+            resp.raise_for_status()
+            data = resp.json()
+            
+            current_state = data.get("state", {})
+            reward = float(data.get("reward", 0.0))
+            done = bool(data.get("done", False))
+            
+            rewards.append(reward)
+            log_step(step, action, reward, done, None)
+            
+            if done: 
                 break
-
-        # Send action to FastAPI
-        resp = requests.post(f"{FASTAPI_URL}/api/step", json={"kind": action_kind, "alertId": None}, timeout=15.0)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        current_state = data.get("state", {})
-        reward = float(data.get("reward", 0.0))
-        done = bool(data.get("done", False))
-
-        rewards.append(reward)
-        steps_taken = step
-        log_step(step=step, action=action_kind, reward=reward, done=done, error=None)
-
-        if done:
+        except Exception as e:
+            log_step(step, "error", 0.0, True, str(e))
             break
 
-    # Calculate Final Score 
-    score = sum(rewards) / 80.0 if rewards else 0.0
-    score = min(max(score, 0.0), 1.0)
-    success = score >= 0.5
-
-    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+    # Final scoring (Assumes max possible reward is 80)
+    final_score = sum(rewards) / 80.0 if rewards else 0.0
+    log_end(final_score >= 0.5, len(rewards), final_score, rewards)
 
 if __name__ == "__main__":
     main()
