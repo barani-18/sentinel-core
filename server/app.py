@@ -1,136 +1,512 @@
-"""
-Sentinel-Core Inference Script
-===================================
-Connects to the Sentinel-Core FastAPI backend and evaluates using the OpenAI client.
-Strictly adheres to [START], [STEP], and [END] logging formats.
-"""
+"""Sentinel-Core: Autonomous Cloud-Native SOC Analyst FastAPI Backend Server"""
 
+import sys
 import os
 import time
-import requests
-import textwrap
-from typing import List, Optional
-from openai import OpenAI
+import random
+import hashlib
+import jwt
+from enum import Enum
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
 
-# --- Configuration ---
-# Using os.environ strictly as requested by the validator to ensure proxy routing.
-API_BASE_URL = os.environ["API_BASE_URL"]
-API_KEY = os.environ["API_KEY"]
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-# Matches the port in your app.py main() function
-FASTAPI_URL = "http://localhost:8000"
+# Add the current directory to sys.path so imports work correctly
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-def log_start(task, env, model):
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+# Correct Absolute Imports
+from database import engine, SessionLocal, get_db
+import models
 
-def log_step(step, action, reward, done, error):
-    error_val = error if error else "null"
-    done_val = str(done).lower()
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+# This creates the tables safely without crashing if the DB is slow
+try:
+    models.Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: DB connection failed on startup: {e}")
 
-def log_end(success, steps, score, rewards):
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+# ---------- Config ----------
+SECRET_KEY = os.getenv("SECRET_KEY", "sentinel-core-soc-2024-secret-key-change-in-prod")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 8
 
-def main():
-    # Initialize OpenAI client with the mandatory environment variables
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    
-    log_start("soc_investigation", "sentinel_soc", MODEL_NAME)
+app = FastAPI(
+    title="Sentinel-Core API",
+    description="Autonomous Cloud-Native SOC Analyst Backend",
+    version="1.0.0"
+)
 
-    # 1. WAIT FOR SERVER: Retries until FastAPI is ready (fixes Connection Refused)
-    current_state = {}
-    connected = False
-    for attempt in range(15):
-        try:
-            # Your server's /reset endpoint
-            resp = requests.post(f"{FASTAPI_URL}/reset", json={}, timeout=5.0)
-            resp.raise_for_status()
-            current_state = resp.json()
-            connected = True
-            break
-        except Exception:
-            print(f"[DEBUG] Waiting for Sentinel-Core server... (Attempt {attempt+1}/15)", flush=True)
-            time.sleep(3)
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    if not connected:
-        log_end(False, 0, 0.0, [])
-        return
+security = HTTPBearer()
 
-    history: List[str] = []
-    rewards: List[float] = []
-    steps_taken = 0
+# ---------- Models ----------
+class Severity(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
 
-    # 2. EVALUATION LOOP
-    for step in range(1, 9): # Running for 8 steps
-        # Construct prompt based on your server's Metrics model
-        metrics = current_state.get("metrics", {})
-        prompt = textwrap.dedent(f"""
-            System Metrics:
-            - Compromised Hosts: {metrics.get('compromisedHosts')}
-            - Anomaly Score: {metrics.get('anomalyScore')}
-            - CPU Usage: {metrics.get('cpu')}
-            - Threat Level: {metrics.get('threatLevel')}
+class AlertStatus(str, Enum):
+    open = "open"
+    investigating = "investigating"
+    blocked = "blocked"
+    isolated = "isolated"
+    ignored = "ignored"
+    escalated = "escalated"
+    resolved = "resolved"
 
-            Choose exactly one action: investigate, isolate_host, block_ip, ignore, escalate, resolve.
-        """).strip()
+class Alert(BaseModel):
+    id: str
+    ts: int
+    type: str
+    severity: Severity
+    confidence: float
+    srcIp: str
+    host: str
+    status: AlertStatus
+    actionTaken: Optional[str] = None
 
-        # LLM Call via Proxy (CRITICAL: Must succeed to pass LLM Criteria Check)
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a SOC Analyst AI. Respond with a single action word."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=15
-        )
+class Host(BaseModel):
+    id: str
+    compromised: bool
+    risk: float
+    cpu: float
+    lastSeen: int
+
+class LogEntry(BaseModel):
+    id: str
+    ts: int
+    msg: str
+    kind: str
+    reward: Optional[float] = None
+
+class Metrics(BaseModel):
+    compromisedHosts: int
+    anomalyScore: float
+    cpu: float
+    threatLevel: float
+
+class HistoryPoint(BaseModel):
+    step: int
+    anomaly: float
+    cpu: float
+    threats: int
+    compromised: int
+
+class StateSnapshot(BaseModel):
+    step: int
+    score: float
+    alerts: List[Alert]
+    hosts: List[Host]
+    metrics: Metrics
+    history: List[HistoryPoint]
+    logs: List[LogEntry]
+
+class StepRequest(BaseModel):
+    kind: str
+    alertId: Optional[str] = None
+
+class StepResponse(BaseModel):
+    state: StateSnapshot
+    reward: float
+    done: bool
+    info: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    mfa_code: Optional[str] = None
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: dict
+
+class User(BaseModel):
+    username: str
+    role: str
+    name: str
+    avatar: str
+
+# ---------- Demo Users ----------
+DEMO_USERS = {
+    "analyst": {
+        "password_hash": hashlib.sha256("soc2024".encode()).hexdigest(),
+        "user": {"username": "analyst", "role": "analyst", "name": "Alex Rivera", "avatar": "AR"},
+        "mfa_required": False
+    },
+    "senior": {
+        "password_hash": hashlib.sha256("soc2024".encode()).hexdigest(),
+        "user": {"username": "senior", "role": "senior_analyst", "name": "Jordan Kim", "avatar": "JK"},
+        "mfa_required": True
+    },
+    "lead": {
+        "password_hash": hashlib.sha256("soc2024".encode()).hexdigest(),
+        "user": {"username": "lead", "role": "soc_lead", "name": "Morgan Chen", "avatar": "MC"},
+        "mfa_required": True
+    },
+    "admin": {
+        "password_hash": hashlib.sha256("sentinel".encode()).hexdigest(),
+        "user": {"username": "admin", "role": "admin", "name": "Dr. Samir Patel", "avatar": "SP"},
+        "mfa_required": True
+    },
+}
+
+# ---------- Sentinel-Core Simulation ----------
+class SentinelCore:
+    def __init__(self, seed: int = None):
+        self.rng = random.Random(seed or int(time.time()))
+        self.state = self._initial_state()
+
+    def _initial_state(self) -> Dict:
+        hosts = []
+        for i in range(12):
+            hosts.append({
+                "id": f"h-{(i+1):02d}",
+                "compromised": False,
+                "risk": 0.1 + self.rng.random() * 0.2,
+                "cpu": 0.2 + self.rng.random() * 0.3,
+                "lastSeen": int(time.time() * 1000),
+            })
         
-        action_kind = (completion.choices[0].message.content or "").strip().lower()
+        alerts = self._gen_initial_alerts(6)
+        metrics = self._compute_metrics(hosts, alerts)
         
-        # Clean up the action to match your Severity/AlertStatus Enums if needed
-        # Fallback to 'investigate' if the model rambles
-        valid_actions = ["investigate", "isolate_host", "block_ip", "ignore", "escalate", "resolve"]
-        final_action = "investigate"
-        for v in valid_actions:
-            if v in action_kind:
-                final_action = v
-                break
+        return {
+            "step": 0,
+            "score": 0.72,
+            "alerts": alerts,
+            "hosts": hosts,
+            "metrics": metrics,
+            "history": [{"step": 0, "anomaly": 0.35, "cpu": 0.32, "threats": 3, "compromised": 0}],
+            "logs": [
+                {"id": self._uid(), "ts": int(time.time() * 1000), "kind": "info", "msg": "Sentinel-Core online. Cloud-native SOC initialized."},
+                {"id": self._uid(), "ts": int(time.time() * 1000), "kind": "success", "msg": "Telemetry ingestion: vpc-flow, EDR, WAF, CloudTrail"},
+            ]
+        }
 
-        # 3. TALK TO SERVER: Corrected from /api/step to /step
-        try:
-            # Your server's StepRequest model: {"kind": str, "alertId": Optional[str]}
-            step_resp = requests.post(
-                f"{FASTAPI_URL}/step",
-                json={"kind": final_action, "alertId": None},
-                timeout=10.0
-            )
-            step_resp.raise_for_status()
-            step_data = step_resp.json()
+    def _gen_initial_alerts(self, n: int) -> List[Dict]:
+        types = ["PortScan", "BruteForce", "Phishing", "Malware", "Lateral", "Exfiltration", "Ransomware"]
+        alerts = []
+        for i in range(n):
+            sev_roll = self.rng.random()
+            severity = "high" if sev_roll > 0.7 else "medium" if sev_roll > 0.35 else "low"
+            alerts.append({
+                "id": f"A-{1000 + i}",
+                "ts": int(time.time() * 1000) - int(self.rng.random() * 1000 * 60 * 8),
+                "type": self.rng.choice(types),
+                "severity": severity,
+                "confidence": round(0.55 + self.rng.random() * 0.4, 2),
+                "srcIp": f"203.{self.rng.randint(0,255)}.{self.rng.randint(0,255)}.{self.rng.randint(0,255)}",
+                "host": f"h-{self.rng.randint(1,12):02d}",
+                "status": "open",
+            })
+        return alerts
+
+    def _compute_metrics(self, hosts, alerts):
+        compromised = sum(1 for h in hosts if h["compromised"])
+        active_high = sum(1 for a in alerts if a["status"] in ["open", "investigating"] and a["severity"] == "high")
+        anomaly = max(0, min(1, 0.2 + active_high * 0.12 + compromised * 0.08 + self.rng.random() * 0.1))
+        cpu = max(0, min(1, 0.25 + self.rng.random() * 0.2 + compromised * 0.05 + active_high * 0.03))
+        threat = max(0, min(1, 0.3 + active_high * 0.1 + compromised * 0.12 + self.rng.random() * 0.08))
+        return {
+            "compromisedHosts": compromised,
+            "anomalyScore": anomaly,
+            "cpu": cpu,
+            "threatLevel": threat
+        }
+
+    def _mutate(self):
+        state = self.state
+        hosts = state["hosts"]
+        alerts = state["alerts"]
+        
+        if self.rng.random() > 0.35:
+            new_a = self._gen_initial_alerts(1)[0]
+            new_a["id"] = f"A-{1000 + self.rng.randint(0, 8999)}"
+            new_a["ts"] = int(time.time() * 1000)
+            alerts.insert(0, new_a)
+            state["logs"].insert(0, {
+                "id": self._uid(),
+                "ts": int(time.time() * 1000),
+                "kind": "warn",
+                "msg": f"New alert {new_a['id']} ({new_a['type']}) from {new_a['srcIp']} → {new_a['host']}"
+            })
             
-            current_state = step_data.get("state", {})
-            reward = float(step_data.get("reward", 0.0))
-            done = bool(step_data.get("done", False))
-            error = None
-        except Exception as e:
-            reward = 0.0
-            done = True
-            error = str(e).replace('\n', ' ')
+        for h in hosts:
+            h["cpu"] = max(0, min(1, h["cpu"] + (self.rng.random() - 0.5) * 0.06))
+            h["risk"] = max(0, min(1, h["risk"] + (self.rng.random() - 0.5) * 0.05 + (0.02 if h["compromised"] else 0)))
+            h["lastSeen"] = int(time.time() * 1000) - self.rng.randint(0, 60000)
+            if not h["compromised"] and h["risk"] > 0.85 and self.rng.random() > 0.6:
+                h["compromised"] = True
+                state["logs"].insert(0, {
+                    "id": self._uid(),
+                    "ts": int(time.time() * 1000),
+                    "kind": "error",
+                    "msg": f"Host {h['id']} compromised (risk {int(h['risk']*100)}%)"
+                })
+        
+        for a in alerts:
+            if a["status"] == "open" and self.rng.random() > 0.85:
+                a["confidence"] = max(0, min(1, a["confidence"] + 0.05))
+                
+        state["metrics"] = self._compute_metrics(hosts, alerts)
+        state["history"].append({
+            "step": state["step"],
+            "anomaly": round(state["metrics"]["anomalyScore"], 3),
+            "cpu": round(state["metrics"]["cpu"], 3),
+            "threats": sum(1 for a in alerts if a["status"] in ["open", "investigating"]),
+            "compromised": sum(1 for h in hosts if h["compromised"]),
+        })
+        if len(state["history"]) > 120:
+            state["history"].pop(0)
 
-        # Logging and metrics
-        rewards.append(reward)
-        steps_taken = step
-        log_step(step, final_action, reward, done, error)
+    def reset(self):
+        self.state = self._initial_state()
+        self.state["logs"].insert(0, {
+            "id": self._uid(),
+            "ts": int(time.time() * 1000),
+            "kind": "info",
+            "msg": "Environment reset."
+        })
+        return self.state
 
-        if done:
-            break
+    def get_state(self):
+        return self.state
 
-    # Calculate final score (normalized to 0.0 - 1.0)
-    total_reward = sum(rewards)
-    score = max(0.0, min(1.0, total_reward / 1.0)) # Adjust normalization as per your scoring logic
+    def step(self, action: dict):
+        prev_score = self.state["score"]
+        self.state["step"] += 1
+        
+        alert = None
+        if action.get("alertId"):
+            alert = next((a for a in self.state["alerts"] if a["id"] == action["alertId"]), None)
+            
+        reward = 0
+        info = ""
+        
+        if not alert and action["kind"] != "noop":
+            reward = -0.05
+            info = "No such alert."
+            self.state["logs"].insert(0, {
+                "id": self._uid(), "ts": int(time.time() * 1000), "kind": "warn",
+                "msg": f"Action failed: alert {action.get('alertId')} not found", "reward": reward
+            })
+        elif alert:
+            kind = action["kind"]
+            if kind == "investigate":
+                if alert["status"] == "open":
+                    alert["status"] = "investigating"
+                    alert["confidence"] = min(1, alert["confidence"] + 0.08)
+                    reward = 0.05
+                    info = "Investigation started."
+                    self.state["logs"].insert(0, {
+                        "id": self._uid(), "ts": int(time.time() * 1000), "kind": "info",
+                        "msg": f"Investigating {alert['id']} ({alert['type']}) on {alert['host']}", "reward": reward
+                    })
+                else:
+                    reward = -0.01
+                    info = "Already in progress."
+            elif kind == "block_ip":
+                alert["status"] = "blocked"
+                alert["actionTaken"] = f"Blocked {alert['srcIp']}"
+                host = next((h for h in self.state["hosts"] if h["id"] == alert["host"]), None)
+                if host:
+                    host["risk"] = max(0, host["risk"] - 0.15)
+                reward = 0.12 if alert["severity"] == "high" else 0.08 if alert["severity"] == "medium" else 0.04
+                info = f"IP {alert['srcIp']} blocked."
+                self.state["logs"].insert(0, {
+                    "id": self._uid(), "ts": int(time.time() * 1000), "kind": "success",
+                    "msg": f"{alert['id']}: {info}", "reward": reward
+                })
+            elif kind == "isolate_host":
+                alert["status"] = "isolated"
+                host = next((h for h in self.state["hosts"] if h["id"] == alert["host"]), None)
+                if host:
+                    host["compromised"] = False
+                    host["risk"] = max(0, host["risk"] - 0.35)
+                    host["cpu"] = max(0, host["cpu"] - 0.1)
+                alert["actionTaken"] = f"Isolated {alert['host']}"
+                reward = 0.15
+                info = f"Host {alert['host']} isolated."
+                self.state["logs"].insert(0, {
+                    "id": self._uid(), "ts": int(time.time() * 1000), "kind": "success",
+                    "msg": f"{alert['id']}: {info}", "reward": reward
+                })
+            elif kind == "ignore":
+                alert["status"] = "ignored"
+                reward = -0.15 if alert["severity"] == "high" else -0.07 if alert["severity"] == "medium" else -0.02
+                info = "Alert ignored."
+                self.state["logs"].insert(0, {
+                    "id": self._uid(), "ts": int(time.time() * 1000),
+                    "kind": "error" if alert["severity"] == "high" else "warn",
+                    "msg": f"{alert['id']} ignored ({alert['severity']})", "reward": reward
+                })
+            elif kind == "escalate":
+                alert["status"] = "escalated"
+                alert["confidence"] = min(1, alert["confidence"] + 0.05)
+                reward = 0.03
+                info = "Escalated to Tier-2."
+                self.state["logs"].insert(0, {
+                    "id": self._uid(), "ts": int(time.time() * 1000), "kind": "info",
+                    "msg": f"{alert['id']}: {info}", "reward": reward
+                })
+            elif kind == "resolve":
+                alert["status"] = "resolved"
+                reward = 0.06
+                info = "Resolved."
+                self.state["logs"].insert(0, {
+                    "id": self._uid(), "ts": int(time.time() * 1000), "kind": "success",
+                    "msg": f"{alert['id']}: resolved", "reward": reward
+                })
+        
+        self._mutate()
+        unhealthy = self.state["metrics"]["compromisedHosts"] * 0.05 + self.state["metrics"]["anomalyScore"] * 0.08
+        self.state["score"] = max(0, min(1, prev_score * 0.9 + 0.1 * (0.5 + reward) - unhealthy * 0.1 + 0.05))
+        done = self.state["step"] >= 200 or self.state["score"] < 0.15
+        
+        return {
+            "state": self.state,
+            "reward": reward,
+            "done": done,
+            "info": info
+        }
+
+    def _uid(self):
+        return hashlib.md5(str(time.time() + self.rng.random()).encode()).hexdigest()[:8]
+
+# ---------- Global State ----------
+sessions: Dict[str, SentinelCore] = {}
+
+def get_core(session_id: str = "default") -> SentinelCore:
+    if session_id not in sessions:
+        sessions[session_id] = SentinelCore()
+    return sessions[session_id]
+
+# ---------- Auth Helpers ----------
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None or username not in DEMO_USERS:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return username
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ---------- API Routes ----------
+@app.get("/")
+def root():
+    return {
+        "name": "Sentinel-Core API",
+        "version": "1.0.0",
+        "description": "Autonomous Cloud-Native SOC Analyst",
+        "endpoints": ["/login", "/reset", "/step", "/state", "/health", "/alerts/create"]
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "timestamp": int(time.time() * 1000)}
+
+@app.post("/login", response_model=LoginResponse)
+def login(req: LoginRequest):
+    user_data = DEMO_USERS.get(req.username.lower())
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
+    if pwd_hash != user_data["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+    if user_data["mfa_required"]:
+        if not req.mfa_code or req.mfa_code != "123456":
+            raise HTTPException(status_code=401, detail="Invalid MFA code")
+            
+    token = create_access_token({"sub": req.username.lower()})
+    get_core(req.username.lower())
     
-    log_end(success=(score > 0.5), steps=steps_taken, score=score, rewards=rewards)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user_data["user"]
+    }
+
+@app.post("/reset", response_model=StateSnapshot)
+def reset_environment():
+    core = get_core("default")
+    return core.reset()
+
+@app.post("/step", response_model=StepResponse)
+def take_action(req: StepRequest):
+    core = get_core("default")
+    return core.step(req.dict())
+
+@app.post("/alerts/create")
+def create_alert(alert_data: dict, db: Session = Depends(get_db)):
+    new_alert = models.AlertRecord(
+        id=f"A-{random.randint(1000, 9999)}",
+        type=alert_data.get("type", "Unknown"),
+        severity=alert_data.get("severity", "medium"),
+        confidence=alert_data.get("confidence", 0.9),
+        status="open",
+        host=alert_data.get("host", "unknown-host")
+    )
+    db.add(new_alert)
+    db.commit()
+    return {"status": "success", "id": new_alert.id}
+
+@app.get("/state")
+def get_state(db: Session = Depends(get_db), username: str = Depends(verify_token)):
+    # Try to pull real rows from the Database
+    try:
+        db_alerts = db.query(models.AlertRecord).all()
+        if db_alerts:
+            return {
+                "step": 0,
+                "score": 0.92,
+                "alerts": db_alerts,
+                "hosts": [], 
+                "metrics": {"compromisedHosts": 0, "anomalyScore": 0.05, "cpu": 0.1, "threatLevel": 0.1},
+                "history": [],
+                "logs": [{"id": "1", "ts": int(time.time()*1000), "kind": "success", "msg": "Connected to Database"}]
+            }
+    except Exception:
+        pass # If DB fails, fallback to simulation below
+        
+    # Fallback to simulation if DB is empty or fails
+    core = get_core(username)
+    return core.get_state()
+
+@app.get("/me", response_model=User)
+def get_me(username: str = Depends(verify_token)):
+    return DEMO_USERS[username]["user"]
+
+# ---------- Runner ----------
+def main():
+    import uvicorn
+    import os
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
+
 
 if __name__ == "__main__":
     main()
