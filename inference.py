@@ -1,241 +1,161 @@
-"""Sentinel-Core: Autonomous Cloud-Native SOC Analyst FastAPI Backend Server"""
-import sys
+"""
+Inference Script Example
+===================================
+MANDATORY
+- Before submitting, ensure the following variables are defined in your environment configuration:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
+    IMAGE_NAME     The name of the local image to use for the environment if you are using from_docker_image() method
+"""
+
+import asyncio
 import os
-import time
-import random
-import hashlib
-import jwt
-import uvicorn
-from enum import Enum
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from sqlalchemy.orm import Session
+import textwrap
+from typing import List, Optional
 
-# ---------- Setup Pathing ----------
-# Ensures local imports like 'database' and 'models' work inside the container
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from openai import OpenAI
+from my_env_v4 import MyEnvV4Action, MyEnvV4Env
 
-try:
-    from database import engine, SessionLocal, get_db
-    import models
-    # Initialize DB tables
-    models.Base.metadata.create_all(bind=engine)
-except ImportError:
-    print("Warning: database.py or models.py not found. Running in Simulation-only mode.")
-    def get_db(): yield None
+IMAGE_NAME = os.getenv("IMAGE_NAME") # If you are using docker image 
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
-# ---------- Config ----------
-SECRET_KEY = os.getenv("SECRET_KEY", "sentinel-core-soc-2024-secret-key")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 8
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+TASK_NAME = os.getenv("MY_ENV_V4_TASK", "echo")
+BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "my_env_v4")
 
-app = FastAPI(
-    title="Sentinel-Core API",
-    description="Autonomous Cloud-Native SOC Analyst Backend",
-    version="1.0.0"
-)
+MAX_STEPS = 8
+TEMPERATURE = 0.7
+MAX_TOKENS = 150
+SUCCESS_SCORE_THRESHOLD = 0.1  # normalized score in [0, 1]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Max possible reward: each token contributes 0.1, across all steps
+_MAX_REWARD_PER_STEP = MAX_TOKENS * 0.1
+MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
 
-security = HTTPBearer()
+SYSTEM_PROMPT = textwrap.dedent(
+    """
+    You are interacting with a simple echo environment.
+    Each turn you must send a message. The environment will echo it back.
+    Reward is proportional to message length: reward = len(message) * 0.1
+    Your goal is to maximize total reward by sending meaningful, substantive messages.
+    Reply with exactly one message string — no quotes, no prefixes, just the message text.
+    """
+).strip()
 
-# ---------- Schema Definitions ----------
-class Severity(str, Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
 
-class AlertStatus(str, Enum):
-    open = "open"
-    investigating = "investigating"
-    blocked = "blocked"
-    isolated = "isolated"
-    ignored = "ignored"
-    escalated = "escalated"
-    resolved = "resolved"
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
-class Alert(BaseModel):
-    id: str
-    ts: int
-    type: str
-    severity: Severity
-    confidence: float
-    srcIp: str
-    host: str
-    status: AlertStatus
-    actionTaken: Optional[str] = None
 
-class Host(BaseModel):
-    id: str
-    compromised: bool
-    risk: float
-    cpu: float
-    lastSeen: int
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
 
-class LogEntry(BaseModel):
-    id: str
-    ts: int
-    msg: str
-    kind: str
-    reward: Optional[float] = None
 
-class Metrics(BaseModel):
-    compromisedHosts: int
-    anomalyScore: float
-    cpu: float
-    threatLevel: float
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-class HistoryPoint(BaseModel):
-    step: int
-    anomaly: float
-    cpu: float
-    threats: int
-    compromised: int
 
-class StateSnapshot(BaseModel):
-    step: int
-    score: float
-    alerts: List[Alert]
-    hosts: List[Host]
-    metrics: Metrics
-    history: List[HistoryPoint]
-    logs: List[LogEntry]
-
-class StepRequest(BaseModel):
-    kind: str
-    alertId: Optional[str] = None
-
-class StepResponse(BaseModel):
-    state: StateSnapshot
-    reward: float
-    done: bool
-    info: str
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    mfa_code: Optional[str] = None
-
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str
-    user: dict
-
-class User(BaseModel):
-    username: str
-    role: str
-    name: str
-    avatar: str
-
-# ---------- Demo Data ----------
-DEMO_USERS = {
-    "analyst": {
-        "password_hash": hashlib.sha256("soc2024".encode()).hexdigest(),
-        "user": {"username": "analyst", "role": "analyst", "name": "Alex Rivera", "avatar": "AR"},
-        "mfa_required": False
-    },
-    "admin": {
-        "password_hash": hashlib.sha256("sentinel".encode()).hexdigest(),
-        "user": {"username": "admin", "role": "admin", "name": "Dr. Samir Patel", "avatar": "SP"},
-        "mfa_required": True
-    },
-}
-
-# ---------- Logic Engine ----------
-class SentinelCore:
-    def __init__(self, seed: int = None):
-        self.rng = random.Random(seed or int(time.time()))
-        self.state = self._initial_state()
-
-    def _initial_state(self) -> Dict[str, Any]:
+def build_user_prompt(step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
+    history_block = "\n".join(history[-4:]) if history else "None"
+    return textwrap.dedent(
+        f"""
+        Step: {step}
+        Last echoed message: {last_echoed!r}
+        Last reward: {last_reward:.2f}
+        Previous steps:
+        {history_block}
+        Send your next message.
         """
-        Fixed: Provided the properly indented block for initial state generation.
-        """
-        current_time = int(time.time())
-        return {
-            "step": 0,
-            "score": 100.0,
-            "alerts": [],
-            "hosts": [
-                {
-                    "id": f"host-{i}",
-                    "compromised": False,
-                    "risk": 0.0,
-                    "cpu": self.rng.uniform(10.0, 45.0),
-                    "lastSeen": current_time
-                } for i in range(1, 4)
+    ).strip()
+
+
+def get_model_message(client: OpenAI, step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
+    user_prompt = build_user_prompt(step, last_echoed, last_reward, history)
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
             ],
-            "metrics": {
-                "compromisedHosts": 0,
-                "anomalyScore": 0.0,
-                "cpu": 35.0,
-                "threatLevel": 0.0
-            },
-            "history": [],
-            "logs": [{
-                "id": "log-0",
-                "ts": current_time,
-                "msg": "Sentinel-Core initialized successfully.",
-                "kind": "system",
-                "reward": 0.0
-            }]
-        }
-
-# Initialize the global engine
-engine_core = SentinelCore()
-
-# ---------- API Endpoints ----------
-
-@app.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
-    """Basic mock authentication."""
-    user_record = DEMO_USERS.get(request.username)
-    
-    if not user_record:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+            timeout=15.0  # Added timeout to prevent 30-minute hangs
+        )
+        text = (completion.choices[0].message.content or "").strip()
         
-    hashed_pw = hashlib.sha256(request.password.encode()).hexdigest()
-    if user_record["password_hash"] != hashed_pw:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        # Replace newlines with spaces to enforce the single-line stdout rule
+        text = text.replace('\n', ' ').replace('\r', '')
         
-    # Mock token generation
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    token_payload = {
-        "sub": request.username,
-        "exp": expire
-    }
-    access_token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
-    
-    return LoginResponse(
-        access_token=access_token,
-        token_type="bearer",
-        user=user_record["user"]
-    )
+        return text if text else "hello"
+    except Exception as exc:
+        print(f"[DEBUG] Model request failed: {exc}", flush=True)
+        return "hello"
 
-@app.post("/api/step", response_model=StepResponse)
-async def process_step(request: StepRequest, token: HTTPAuthorizationCredentials = Depends(security)):
-    """Mock processing step for the SOC simulation engine."""
-    # In a real app, you would process the request.kind (e.g., 'investigate', 'isolate') here.
+
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    env = await MyEnvV4Env.from_docker_image(IMAGE_NAME)
+
+    history: List[str] = []
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
     
-    # Increment step
-    engine_core.state["step"] += 1
-    
-    return StepResponse(
-        state=StateSnapshot(**engine_core.state),
-        reward=10.0,
-        done=False,
-        info=f"Action '{request.kind}' processed."
-    )
+    try:  # Fixed the indentation error here
+        result = await env.reset() # OpenENV.reset()
+        last_echoed = result.observation.echoed_message
+        last_reward = 0.0
+
+        for step in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
+
+            message = get_model_message(client, step, last_echoed, last_reward, history)
+
+            result = await env.step(MyEnvV4Action(message=message))
+            obs = result.observation
+
+            reward = result.reward or 0.0
+            done = result.done
+            error = None
+
+            rewards.append(reward)
+            steps_taken = step
+            last_echoed = obs.echoed_message
+            last_reward = reward
+
+            log_step(step=step, action=message, reward=reward, done=done, error=error)
+
+            history.append(f"Step {step}: {message!r} -> reward {reward:+.2f}")
+
+            if done:
+                break
+
+        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
+        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1]
+        success = score >= SUCCESS_SCORE_THRESHOLD
+
+    finally:
+        try:
+            await env.close()
+        except Exception as e:
+            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
+        
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    asyncio.run(main())
