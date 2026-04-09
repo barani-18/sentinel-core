@@ -3,7 +3,7 @@ SentinelCore Inference Script
 ===================================
 Connects to the local FastAPI SOC simulator and evaluates using the OpenAI client.
 Strictly adheres to the [START], [STEP], and [END] logging format.
-Enforces strict LiteLLM proxy routing via os.environ.
+Enforces strict LiteLLM proxy routing via os.environ with NO silent failures.
 """
 
 import os
@@ -13,10 +13,14 @@ from typing import List, Optional
 from openai import OpenAI
 
 # --- Configuration ---
-# MODEL_NAME can use getenv with a fallback, but the keys/URLs MUST use os.environ later
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
-BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
+# WE MUST USE os.environ FOR THE PROXY VARIABLES. NO FALLBACKS ALLOWED.
+# If these are missing, the script will crash immediately (which is what we want).
+API_BASE_URL = os.environ["API_BASE_URL"]
+API_KEY = os.environ["API_KEY"]
+
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+TASK_NAME = os.environ.get("MY_ENV_V4_TASK", "soc_investigation")
+BENCHMARK = os.environ.get("MY_ENV_V4_BENCHMARK", "sentinel_soc")
 
 # FastAPI Server configuration
 FASTAPI_URL = "http://localhost:8000"
@@ -59,56 +63,35 @@ def get_model_action(client: OpenAI, step: int, current_state: dict, history: Li
         Do not include punctuation or quotes.
     """).strip()
 
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a cybersecurity AI. Respond with a single action word."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=10,
-            timeout=15.0 # Stop infinite hangs!
-        )
-        text = (completion.choices[0].message.content or "").strip().lower()
-        
-        # Clean up text to ensure it doesn't break the single-line log rule
-        text = text.replace('\n', ' ').replace('\r', '')
-        
-        # Fallback to 'investigate' if the model rambles
-        valid_actions = ["investigate", "isolate", "block", "ignore"]
-        for valid in valid_actions:
-            if valid in text:
-                return valid
-        return "investigate"
-        
-    except Exception as exc:
-        # If the LiteLLM proxy fails, we print it to debug so it doesn't fail silently
-        print(f"[DEBUG] Proxy/Model request failed: {exc}", flush=True)
-        return "investigate"
+    # DANGER ZONE: NO TRY/EXCEPT HERE.
+    # If the hackathon's proxy rejects us or times out, we want this to crash loudly
+    # so we can see the real error in the execution logs.
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a cybersecurity AI. Respond with a single action word."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=10,
+        timeout=30.0 # Increased to 30s to give their proxy plenty of time
+    )
+    
+    text = (completion.choices[0].message.content or "").strip().lower()
+    text = text.replace('\n', ' ').replace('\r', '')
+    
+    valid_actions = ["investigate", "isolate", "block", "ignore"]
+    for valid in valid_actions:
+        if valid in text:
+            return valid
+    return "investigate"
 
 # --- Main Evaluation Loop ---
 def main() -> None:
-    # ---------------------------------------------------------
-    # CRITICAL FIX: STRICT LITELLM PROXY COMPLIANCE
-    # Using os.environ directly forces the script to use the injected
-    # proxy variables. If the evaluator doesn't pass them, it crashes loudly
-    # rather than failing silently.
-    # ---------------------------------------------------------
-    try:
-        api_base = os.environ["API_BASE_URL"]
-        api_key = os.environ["API_KEY"]
-    except KeyError as e:
-        print(f"[DEBUG] FATAL: Missing required environment variable for proxy: {e}", flush=True)
-        # If we can't find the proxy keys, we must exit early.
-        log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
-        log_end(success=False, steps=0, score=0.0, rewards=[])
-        return
-
     # Initialize client strictly with the proxy variables
     client = OpenAI(
-        base_url=api_base,
-        api_key=api_key
+        base_url=API_BASE_URL,
+        api_key=API_KEY
     )
 
     history: List[str] = []
@@ -133,7 +116,7 @@ def main() -> None:
         # 2. Run the Simulation Loop
         for step in range(1, MAX_STEPS + 1):
             
-            # Ask LLM for the next move via the Proxy
+            # Ask LLM for the next move via the Proxy (will crash if proxy fails)
             action_kind = get_model_action(client, step, current_state, history)
 
             # Send action to FastAPI
@@ -174,13 +157,9 @@ def main() -> None:
         score = min(max(score, 0.0), 1.0)  # clamp to [0, 1] as required
         success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as general_error:
-        print(f"[DEBUG] Unhandled exception in loop: {general_error}", flush=True)
-
     finally:
-        # Always output the [END] log
+        # Always output the [END] log even if we crashed halfway
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
 
 if __name__ == "__main__":
     main()
