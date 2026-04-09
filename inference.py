@@ -13,9 +13,10 @@ from openai import OpenAI
 
 # --- Configuration ---
 # STRICT COMPLIANCE: Defaults set ONLY for API_BASE_URL and MODEL_NAME.
+# Using API_KEY explicitly as required by the LiteLLM proxy evaluator.
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN") # NO DEFAULT VALUE HERE
+API_KEY = os.getenv("API_KEY") # No default value, injected by evaluator proxy
 
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
@@ -90,8 +91,8 @@ def get_model_action(client: OpenAI, step: int, current_state: dict, history: Li
 
 # --- Main Evaluation Loop ---
 def main() -> None:
-    # STRICT COMPLIANCE: Initialized specifically with HF_TOKEN
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    # STRICT COMPLIANCE: Initialized specifically with API_KEY for the proxy
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     history: List[str] = []
     rewards: List[float] = []
