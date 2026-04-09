@@ -1,53 +1,35 @@
 """
-Inference Script Example
+SentinelCore Inference Script
 ===================================
-MANDATORY
-- Before submitting, ensure the following variables are defined in your environment configuration:
-    API_BASE_URL   The API endpoint for the LLM.
-    MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
-    IMAGE_NAME     The name of the local image to use for the environment if you are using from_docker_image() method
+Connects to the local FastAPI SOC simulator and evaluates using the OpenAI client.
+Strictly adheres to the [START], [STEP], and [END] logging format.
 """
 
-import asyncio
 import os
 import textwrap
+import requests
 from typing import List, Optional
-
 from openai import OpenAI
-from my_env_v4 import MyEnvV4Action, MyEnvV4Env
 
-IMAGE_NAME = os.getenv("IMAGE_NAME") # If you are using docker image 
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-
+# --- Configuration ---
+# STRICT COMPLIANCE: Defaults set ONLY for API_BASE_URL and MODEL_NAME.
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-TASK_NAME = os.getenv("MY_ENV_V4_TASK", "echo")
-BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "my_env_v4")
+HF_TOKEN = os.getenv("HF_TOKEN") # NO DEFAULT VALUE HERE
 
+TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
+BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
+
+# FastAPI Server configuration
+FASTAPI_URL = "http://localhost:8000"
 MAX_STEPS = 8
 TEMPERATURE = 0.7
 MAX_TOKENS = 150
-SUCCESS_SCORE_THRESHOLD = 0.1  # normalized score in [0, 1]
+SUCCESS_SCORE_THRESHOLD = 0.5
 
-# Max possible reward: each token contributes 0.1, across all steps
-_MAX_REWARD_PER_STEP = MAX_TOKENS * 0.1
-MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
-
-SYSTEM_PROMPT = textwrap.dedent(
-    """
-    You are interacting with a simple echo environment.
-    Each turn you must send a message. The environment will echo it back.
-    Reward is proportional to message length: reward = len(message) * 0.1
-    Your goal is to maximize total reward by sending meaningful, substantive messages.
-    Reply with exactly one message string — no quotes, no prefixes, just the message text.
-    """
-).strip()
-
-
+# --- Mandatory Logging Functions ---
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
-
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
@@ -57,54 +39,59 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
         flush=True,
     )
 
-
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
-
-def build_user_prompt(step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
+# --- LLM Interaction ---
+def get_model_action(client: OpenAI, step: int, current_state: dict, history: List[str]) -> str:
+    """Asks the LLM what action to take based on the current SOC state."""
     history_block = "\n".join(history[-4:]) if history else "None"
-    return textwrap.dedent(
-        f"""
+    
+    prompt = textwrap.dedent(f"""
+        You are an autonomous SOC Analyst. 
         Step: {step}
-        Last echoed message: {last_echoed!r}
-        Last reward: {last_reward:.2f}
+        Current System CPU: {current_state.get('metrics', {}).get('cpu', 'Unknown')}
+        Threat Level: {current_state.get('metrics', {}).get('threatLevel', 'Unknown')}
+        
         Previous steps:
         {history_block}
-        Send your next message.
-        """
-    ).strip()
+        
+        Respond with exactly one action word from this list: [investigate, isolate, block, ignore].
+        Do not include punctuation or quotes.
+    """).strip()
 
-
-def get_model_message(client: OpenAI, step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
-    user_prompt = build_user_prompt(step, last_echoed, last_reward, history)
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": "You are a cybersecurity AI. Respond with a single action word."},
+                {"role": "user", "content": prompt},
             ],
             temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-            timeout=15.0  # Added timeout to prevent 30-minute hangs
+            max_tokens=10,
+            timeout=15.0 # Stop infinite hangs!
         )
-        text = (completion.choices[0].message.content or "").strip()
+        text = (completion.choices[0].message.content or "").strip().lower()
         
-        # Replace newlines with spaces to enforce the single-line stdout rule
+        # Clean up text to ensure it doesn't break the single-line log rule
         text = text.replace('\n', ' ').replace('\r', '')
         
-        return text if text else "hello"
+        # Fallback to 'investigate' if the model rambles
+        valid_actions = ["investigate", "isolate", "block", "ignore"]
+        for valid in valid_actions:
+            if valid in text:
+                return valid
+        return "investigate"
+        
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        return "hello"
+        return "investigate"
 
-
-async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = await MyEnvV4Env.from_docker_image(IMAGE_NAME)
+# --- Main Evaluation Loop ---
+def main() -> None:
+    # STRICT COMPLIANCE: Initialized specifically with HF_TOKEN
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     history: List[str] = []
     rewards: List[float] = []
@@ -113,49 +100,69 @@ async def main() -> None:
     success = False
 
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
-    
-    try:  # Fixed the indentation error here
-        result = await env.reset() # OpenENV.reset()
-        last_echoed = result.observation.echoed_message
-        last_reward = 0.0
 
+    try:
+        # 1. Reset the FastAPI Environment
+        try:
+            reset_resp = requests.post(f"{FASTAPI_URL}/reset", json={}, timeout=10.0)
+            reset_resp.raise_for_status()
+            current_state = reset_resp.json().get("state", {})
+        except Exception as e:
+            log_step(1, "reset", 0.0, True, f"Failed to connect to FastAPI: {e}")
+            log_end(False, 0, 0.0, [])
+            return
+
+        # 2. Run the Simulation Loop
         for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                break
+            
+            # Ask LLM for the next move
+            action_kind = get_model_action(client, step, current_state, history)
 
-            message = get_model_message(client, step, last_echoed, last_reward, history)
+            # Send action to FastAPI
+            try:
+                resp = requests.post(
+                    f"{FASTAPI_URL}/api/step",
+                    json={"kind": action_kind, "alertId": None},
+                    timeout=10.0
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                
+                current_state = data.get("state", {})
+                reward = float(data.get("reward", 0.0))
+                done = bool(data.get("done", False))
+                error = None
+                
+            except Exception as e:
+                reward = 0.0
+                done = True
+                error = f"API Error: {str(e)}"
+                error = error.replace('\n', ' ')
 
-            result = await env.step(MyEnvV4Action(message=message))
-            obs = result.observation
-
-            reward = result.reward or 0.0
-            done = result.done
-            error = None
-
+            # Record metrics
             rewards.append(reward)
             steps_taken = step
-            last_echoed = obs.echoed_message
-            last_reward = reward
+            history.append(f"Step {step}: {action_kind} -> reward {reward:+.2f}")
 
-            log_step(step=step, action=message, reward=reward, done=done, error=error)
-
-            history.append(f"Step {step}: {message!r} -> reward {reward:+.2f}")
+            # Print exact stdout format required by evaluator
+            log_step(step=step, action=action_kind, reward=reward, done=done, error=error)
 
             if done:
                 break
 
-        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
-        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1]
+        # 3. Calculate Final Score (Assuming max 10 reward per step for 8 steps)
+        max_possible_reward = MAX_STEPS * 10.0 
+        score = sum(rewards) / max_possible_reward if max_possible_reward > 0 else 0.0
+        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1] as required
         success = score >= SUCCESS_SCORE_THRESHOLD
 
+    except Exception as general_error:
+        print(f"[DEBUG] Unhandled exception in loop: {general_error}", flush=True)
+
     finally:
-        try:
-            await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
-        
+        # Always output the [END] log
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
