@@ -1,7 +1,7 @@
 """
 Sentinel-Core Inference Script
 ===================================
-Connects to the local FastAPI backend and evaluates using the OpenAI client.
+Connects to the local FastAPI backend (with JWT Auth) and evaluates using the OpenAI client.
 STRICT COMPLIANCE: Uses the exact minimal pattern required by the hackathon.
 """
 
@@ -41,22 +41,45 @@ def log_end(success, steps, score, rewards):
 def main():
     log_start("soc_investigation", "sentinel_soc", MODEL_NAME)
 
-    # 1. WAIT FOR SERVER: Retry loop so we don't crash while FastAPI boots up
-    current_state = {}
-    connected = False
+    # 1. WAIT FOR SERVER: Use /health because it doesn't require auth!
+    server_ready = False
     for attempt in range(15):
         try:
-            resp = requests.post(f"{FASTAPI_URL}/reset", json={}, timeout=5.0)
-            resp.raise_for_status()
-            current_state = resp.json()
-            connected = True
-            break
+            resp = requests.get(f"{FASTAPI_URL}/health", timeout=5.0)
+            if resp.status_code == 200:
+                server_ready = True
+                break
         except Exception:
             print(f"[DEBUG] Waiting for Sentinel-Core server... (Attempt {attempt+1}/15)", flush=True)
             time.sleep(3)
 
-    if not connected:
-        # If your main.py server crashes, we need to fail cleanly
+    if not server_ready:
+        print("[DEBUG] FATAL: Server never booted up.", flush=True)
+        log_end(False, 0, 0.0, [])
+        return
+
+    # 2. LOGIN TO GET JWT TOKEN
+    try:
+        login_resp = requests.post(
+            f"{FASTAPI_URL}/login", 
+            json={"username": "analyst", "password": "soc2024"},
+            timeout=5.0
+        )
+        login_resp.raise_for_status()
+        token = login_resp.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+    except Exception as e:
+        print(f"[DEBUG] FATAL: Authentication failed! {e}", flush=True)
+        log_end(False, 0, 0.0, [])
+        return
+
+    # 3. RESET ENVIRONMENT (Using Token)
+    try:
+        reset_resp = requests.post(f"{FASTAPI_URL}/reset", headers=headers, json={}, timeout=5.0)
+        reset_resp.raise_for_status()
+        current_state = reset_resp.json()
+    except Exception as e:
+        print(f"[DEBUG] FATAL: Reset failed! {e}", flush=True)
         log_end(False, 0, 0.0, [])
         return
 
@@ -64,7 +87,7 @@ def main():
     rewards: List[float] = []
     steps_taken = 0
 
-    # 2. THE EVALUATION LOOP
+    # 4. THE EVALUATION LOOP
     for step in range(1, 9):
         metrics = current_state.get("metrics", {})
         prompt = textwrap.dedent(f"""
@@ -77,7 +100,7 @@ def main():
             Choose exactly one action: investigate, isolate_host, block_ip, ignore, escalate, resolve.
         """).strip()
 
-        # The Mandatory LLM Call through their Proxy
+        # The Mandatory LLM Call through the proxy
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -94,14 +117,14 @@ def main():
             print(f"[DEBUG] LLM Call Failed: {e}", flush=True)
             action_kind = "investigate"
 
-        # Cleanup output
         valid_actions = ["investigate", "isolate_host", "block_ip", "ignore", "escalate", "resolve"]
         final_action = next((v for v in valid_actions if v in action_kind), "investigate")
 
-        # 3. TALK TO YOUR SERVER
+        # 5. EXECUTE STEP (Using Token)
         try:
             step_resp = requests.post(
                 f"{FASTAPI_URL}/step",
+                headers=headers,
                 json={"kind": final_action, "alertId": None},
                 timeout=10.0
             )
@@ -125,7 +148,7 @@ def main():
             break
 
     # Calculate final score
-    score = sum(rewards) / 1.0  # Adjust as needed based on your scoring logic
+    score = sum(rewards) / 1.0  
     score = max(0.0, min(1.0, score)) 
     log_end(success=(score > 0.5), steps=steps_taken, score=score, rewards=rewards)
 
