@@ -13,7 +13,7 @@ from typing import List, Optional
 from openai import OpenAI
 
 # --- Configuration ---
-# MODEL_NAME can have a fallback, but keys/URLs MUST NOT.
+# MODEL_NAME can use getenv with a fallback, but the keys/URLs MUST use os.environ later
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
@@ -83,7 +83,8 @@ def get_model_action(client: OpenAI, step: int, current_state: dict, history: Li
         return "investigate"
         
     except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
+        # If the LiteLLM proxy fails, we print it to debug so it doesn't fail silently
+        print(f"[DEBUG] Proxy/Model request failed: {exc}", flush=True)
         return "investigate"
 
 # --- Main Evaluation Loop ---
@@ -91,15 +92,20 @@ def main() -> None:
     # ---------------------------------------------------------
     # CRITICAL FIX: STRICT LITELLM PROXY COMPLIANCE
     # Using os.environ directly forces the script to use the injected
-    # proxy variables without any chance of bypassing them.
+    # proxy variables. If the evaluator doesn't pass them, it crashes loudly
+    # rather than failing silently.
     # ---------------------------------------------------------
     try:
         api_base = os.environ["API_BASE_URL"]
         api_key = os.environ["API_KEY"]
     except KeyError as e:
-        print(f"[DEBUG] Missing required environment variable for proxy: {e}", flush=True)
+        print(f"[DEBUG] FATAL: Missing required environment variable for proxy: {e}", flush=True)
+        # If we can't find the proxy keys, we must exit early.
+        log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return
 
+    # Initialize client strictly with the proxy variables
     client = OpenAI(
         base_url=api_base,
         api_key=api_key
