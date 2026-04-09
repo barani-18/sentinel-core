@@ -3,6 +3,7 @@ SentinelCore Inference Script
 ===================================
 Connects to the local FastAPI SOC simulator and evaluates using the OpenAI client.
 Strictly adheres to the [START], [STEP], and [END] logging format.
+Enforces strict LiteLLM proxy routing via os.environ.
 """
 
 import os
@@ -12,12 +13,8 @@ from typing import List, Optional
 from openai import OpenAI
 
 # --- Configuration ---
-# STRICT COMPLIANCE: Defaults set ONLY for API_BASE_URL and MODEL_NAME.
-# Using API_KEY explicitly as required by the LiteLLM proxy evaluator.
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+# MODEL_NAME can have a fallback, but keys/URLs MUST NOT.
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY = os.getenv("API_KEY") # No default value, injected by evaluator proxy
-
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "soc_investigation")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "sentinel_soc")
 
@@ -91,8 +88,22 @@ def get_model_action(client: OpenAI, step: int, current_state: dict, history: Li
 
 # --- Main Evaluation Loop ---
 def main() -> None:
-    # STRICT COMPLIANCE: Initialized specifically with API_KEY for the proxy
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # ---------------------------------------------------------
+    # CRITICAL FIX: STRICT LITELLM PROXY COMPLIANCE
+    # Using os.environ directly forces the script to use the injected
+    # proxy variables without any chance of bypassing them.
+    # ---------------------------------------------------------
+    try:
+        api_base = os.environ["API_BASE_URL"]
+        api_key = os.environ["API_KEY"]
+    except KeyError as e:
+        print(f"[DEBUG] Missing required environment variable for proxy: {e}", flush=True)
+        return
+
+    client = OpenAI(
+        base_url=api_base,
+        api_key=api_key
+    )
 
     history: List[str] = []
     rewards: List[float] = []
@@ -116,7 +127,7 @@ def main() -> None:
         # 2. Run the Simulation Loop
         for step in range(1, MAX_STEPS + 1):
             
-            # Ask LLM for the next move
+            # Ask LLM for the next move via the Proxy
             action_kind = get_model_action(client, step, current_state, history)
 
             # Send action to FastAPI
@@ -151,7 +162,7 @@ def main() -> None:
             if done:
                 break
 
-        # 3. Calculate Final Score (Assuming max 10 reward per step for 8 steps)
+        # 3. Calculate Final Score 
         max_possible_reward = MAX_STEPS * 10.0 
         score = sum(rewards) / max_possible_reward if max_possible_reward > 0 else 0.0
         score = min(max(score, 0.0), 1.0)  # clamp to [0, 1] as required
